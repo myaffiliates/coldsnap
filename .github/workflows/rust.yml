@@ -10,7 +10,7 @@ on:
       - ".github/dependabot.yml"
   # triggers when a PR is merged
   push:
-    branches: [develop]
+    branches: ["**"]
     paths-ignore:
       - "**.md"
       - ".github/dependabot.yml"
@@ -46,3 +46,15 @@ jobs:
       - run: cargo fmt -- --check
       - run: cargo install cargo-deny --locked
       - run: cargo deny --features ${{ matrix.features }} --no-default-features check licenses bans sources
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: rustup default stable
+      - run: rustup component add rustfmt
+      - run: rustup component add clippy
+      - run: cargo test --locked
+      - run: cargo build --locked
+      - run: cargo clippy --locked -- -D warnings --no-deps
+      - run: cargo fmt -- --check

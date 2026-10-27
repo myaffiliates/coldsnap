@@ -87,6 +87,10 @@ Run `coldsnap --help` to see more options.
 $ cargo install --locked coldsnap
 ```
 
+Prebuilt Linux and Windows binaries are published on the
+[GitHub Releases](https://github.com/myaffiliates/coldsnap/releases) page. The Windows build supports
+file-based uploads and downloads; block-device access is unavailable on Windows.
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.

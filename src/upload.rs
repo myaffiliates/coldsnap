@@ -5,7 +5,7 @@
 Upload Amazon EBS snapshots.
 */
 
-use crate::block_device::get_block_device_size;
+use crate::block_device::{get_block_device_size, is_block_device};
 use aws_sdk_ebs::primitives::ByteStream;
 use aws_sdk_ebs::types::{ChecksumAggregationMethod, ChecksumAlgorithm, Tag};
 use aws_sdk_ebs::Client as EbsClient;
@@ -22,7 +22,6 @@ use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::ffi::OsStr;
 use std::io::SeekFrom;
-use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
@@ -154,6 +153,9 @@ impl SnapshotUploader {
         parent_snapshot_id: Option<String>,
         workers: Option<usize>,
     ) -> Result<String> {
+        let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
+        ensure!(worker_count > 0, error::InvalidWorkerCountSnafu);
+
         let path = path.as_ref();
         let description = description.map(|s| s.to_string()).unwrap_or_else(|| {
             path.file_name()
@@ -166,7 +168,7 @@ impl SnapshotUploader {
             .await
             .context(error::ReadFileMetadataSnafu { path })?;
 
-        let file_size = if file_meta.file_type().is_block_device() {
+        let file_size = if is_block_device(&file_meta.file_type()) {
             get_block_device_size(path).context(error::GetBlockDeviceSizeSnafu)?
         } else {
             self.file_size(&file_meta).await?
@@ -267,8 +269,6 @@ impl SnapshotUploader {
         // Distribute the work across a fixed number of concurrent workers.
         // New threads will be created by the runtime as needed, but we'll
         // only process this many blocks at once to limit resource usage.
-        let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
-        ensure!(worker_count > 0, error::InvalidWorkerCountSnafu);
         debug!(
             "Using {} concurrent upload workers across {} client shards",
             worker_count,

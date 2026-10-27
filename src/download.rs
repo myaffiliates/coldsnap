@@ -5,7 +5,7 @@
 Download Amazon EBS snapshots.
 */
 
-use crate::block_device::get_block_device_size;
+use crate::block_device::{get_block_device_size, is_block_device};
 use async_trait::async_trait;
 use aws_sdk_ebs::Client as EbsClient;
 use base64::engine::general_purpose::STANDARD as base64_engine;
@@ -19,7 +19,6 @@ use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 use std::io::SeekFrom;
-use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -574,7 +573,7 @@ impl BlockDeviceTarget {
             .await
             .context(error::ReadFileMetadataSnafu { path })?;
 
-        if file_meta.file_type().is_block_device() {
+        if is_block_device(&file_meta.file_type()) {
             Ok(true)
         } else {
             Ok(false)
@@ -658,12 +657,30 @@ impl SnapshotWriteTarget for FileTarget {
 
     // persist file to destination
     async fn finalize(&mut self) -> Result<()> {
-        tokio::fs::rename(&self.partial_path, &self.path)
-            .await
-            .context(error::RenameFileSnafu {
-                from: &self.partial_path,
-                to: &self.path,
-            })?;
+        #[cfg(windows)]
+        let rename_result = replace_file(&self.partial_path, &self.path);
+        #[cfg(not(windows))]
+        let rename_result = tokio::fs::rename(&self.partial_path, &self.path).await;
+
+        rename_result.context(error::RenameFileSnafu {
+            from: &self.partial_path,
+            to: &self.path,
+        })?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+    let result = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
         Ok(())
     }
 }
@@ -969,5 +986,22 @@ mod test {
         let should_resume = progress.snapshot_id == current_snapshot_id;
 
         assert!(!should_resume);
+    }
+
+    #[tokio::test]
+    async fn finalize_replaces_existing_file() {
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("disk.img");
+        let partial_path = dir.path().join("disk.img.partial");
+        std::fs::write(&target_path, b"old").unwrap();
+        std::fs::write(&partial_path, b"new").unwrap();
+
+        let mut target = FileTarget {
+            path: target_path.clone(),
+            partial_path,
+        };
+        target.finalize().await.unwrap();
+
+        assert_eq!(std::fs::read(target_path).unwrap(), b"new");
     }
 }

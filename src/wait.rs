@@ -8,8 +8,8 @@ Wait for Amazon EBS snapshots to be in the desired state.
 use aws_sdk_ec2::types::SnapshotState;
 use aws_sdk_ec2::Client as Ec2Client;
 use snafu::{ensure, ResultExt, Snafu};
-use std::thread::sleep;
 use std::time::Duration;
+use tokio::time::sleep;
 
 #[derive(Debug, Snafu)]
 pub struct Error(error::Error);
@@ -140,7 +140,7 @@ impl SnapshotWaiter {
                 // Did not receive list; reset success count and try again (if we have spare attempts)
                 successes = 0;
             };
-            sleep(duration_between_attempts);
+            sleep(duration_between_attempts).await;
         }
     }
 }
