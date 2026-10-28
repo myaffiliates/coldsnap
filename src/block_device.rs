@@ -105,3 +105,27 @@ mod error {
         UnsupportedBlockDevice { path: PathBuf },
     }
 }
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn regular_file_is_not_a_block_device() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("disk.img");
+        std::fs::write(&path, b"data").unwrap();
+
+        let file_type = std::fs::metadata(path).unwrap().file_type();
+        assert!(!is_block_device(&file_type));
+    }
+
+    #[test]
+    fn directory_is_not_a_block_device() {
+        let dir = tempdir().unwrap();
+        let file_type = std::fs::metadata(dir.path()).unwrap().file_type();
+
+        assert!(!is_block_device(&file_type));
+    }
+}

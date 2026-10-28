@@ -153,8 +153,7 @@ impl SnapshotUploader {
         parent_snapshot_id: Option<String>,
         workers: Option<usize>,
     ) -> Result<String> {
-        let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
-        ensure!(worker_count > 0, error::InvalidWorkerCountSnafu);
+        let worker_count = validated_worker_count(workers)?;
 
         let path = path.as_ref();
         let description = description.map(|s| s.to_string()).unwrap_or_else(|| {
@@ -548,6 +547,12 @@ impl SnapshotUploader {
     }
 }
 
+fn validated_worker_count(workers: Option<usize>) -> Result<usize> {
+    let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
+    ensure!(worker_count > 0, error::InvalidWorkerCountSnafu);
+    Ok(worker_count)
+}
+
 /// Stores the context needed to upload a snapshot block.
 struct BlockContext {
     path: PathBuf,
@@ -743,5 +748,25 @@ mod test {
     #[should_panic(expected = "need at least one EBS client")]
     fn with_client_shards_rejects_empty() {
         SnapshotUploader::with_client_shards(vec![]);
+    }
+
+    #[test]
+    fn worker_count_defaults_to_configured_concurrency() {
+        assert_eq!(
+            validated_worker_count(None).unwrap(),
+            SNAPSHOT_BLOCK_WORKERS
+        );
+    }
+
+    #[test]
+    fn worker_count_accepts_explicit_positive_values() {
+        assert_eq!(validated_worker_count(Some(1)).unwrap(), 1);
+        assert_eq!(validated_worker_count(Some(100)).unwrap(), 100);
+    }
+
+    #[test]
+    fn worker_count_rejects_zero_before_upload() {
+        let error = validated_worker_count(Some(0)).unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
     }
 }

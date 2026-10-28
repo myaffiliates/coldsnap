@@ -81,6 +81,7 @@ impl SnapshotDownloader {
         checkpoint: Option<CheckpointBehavior>,
         workers: Option<usize>,
     ) -> Result<()> {
+        let worker_count = validated_worker_count(workers)?;
         let checkpoint = checkpoint.unwrap_or(CheckpointBehavior::Disable);
         let path = path.as_ref();
         let _ = path
@@ -97,25 +98,22 @@ impl SnapshotDownloader {
         let mut previously_completed: Vec<i32> = Vec::new();
         let mut resuming = false;
 
-        let checkpoint_data = match checkpoint != CheckpointBehavior::Disable {
-            true => tokio::fs::read_to_string(&checkpoint_file).await.ok(),
-            false => None,
-        }
-        .and_then(|data| serde_json::from_str::<ProgressFile>(&data).ok())
-        .filter(|p| p.snapshot_id == snapshot_id);
+        let checkpoint_data = read_checkpoint(path, checkpoint, snapshot_id).await;
 
-        if let Some(progress) = checkpoint_data {
-            let completed: std::collections::BTreeSet<i32> =
-                progress.completed_blocks.iter().copied().collect();
-            let original_count = snapshot.blocks.len();
-            snapshot.blocks.retain(|b| !completed.contains(&b.index));
-            previously_completed = progress.completed_blocks;
+        let original_count = snapshot.blocks.len();
+        if let Some(completed_blocks) =
+            checkpoint_data.and_then(|progress| filter_completed_blocks(&mut snapshot, progress))
+        {
+            previously_completed = completed_blocks;
+            resuming = !previously_completed.is_empty();
+        }
+
+        if resuming {
             debug!(
                 "Resuming download: {} of {} blocks remaining",
                 snapshot.blocks.len(),
                 original_count
             );
-            resuming = true;
         }
 
         let mut target = if BlockDeviceTarget::is_valid(path).await? {
@@ -136,7 +134,7 @@ impl SnapshotDownloader {
             progress_bar,
             checkpoint,
             previously_completed,
-            workers,
+            worker_count,
         )
         .await?;
         target.finalize().await?;
@@ -158,7 +156,7 @@ impl SnapshotDownloader {
         progress_bar: Option<ProgressBar>,
         checkpoint: CheckpointBehavior,
         previously_completed: Vec<i32>,
-        workers: Option<usize>,
+        worker_count: usize,
     ) -> Result<()> {
         // Collect errors encountered while downloading blocks, since we can't
         // return a result directly through `for_each_concurrent`.
@@ -203,8 +201,6 @@ impl SnapshotDownloader {
         // Distribute the work across a fixed number of concurrent workers.
         // New threads will be created by the runtime as needed, but we'll
         // only process this many blocks at once to limit resource usage.
-        let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
-        ensure!(worker_count > 0, error::InvalidWorkerCountSnafu);
         debug!("Using {} concurrent download workers", worker_count);
         let download = stream::iter(block_contexts).for_each_concurrent(worker_count, |context| {
             let completed_blocks = Arc::clone(&completed_blocks);
@@ -513,6 +509,12 @@ impl SnapshotDownloader {
     }
 }
 
+fn validated_worker_count(workers: Option<usize>) -> Result<usize> {
+    let worker_count = workers.unwrap_or(SNAPSHOT_BLOCK_WORKERS);
+    ensure!(worker_count > 0, error::InvalidWorkerCountSnafu);
+    Ok(worker_count)
+}
+
 /// Stores the metadata about the snapshot contents.
 struct Snapshot {
     snapshot_id: String,
@@ -690,6 +692,48 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
 struct ProgressFile {
     snapshot_id: String,
     completed_blocks: Vec<i32>,
+}
+
+/// Parses a checkpoint file, ignoring malformed or incompatible data.
+fn parse_progress_file(data: &str) -> Option<ProgressFile> {
+    serde_json::from_str(data).ok()
+}
+
+/// Reads a checkpoint only when checkpointing is enabled and it belongs to this snapshot.
+async fn read_checkpoint(
+    target_path: &Path,
+    behavior: CheckpointBehavior,
+    snapshot_id: &str,
+) -> Option<ProgressFile> {
+    if behavior == CheckpointBehavior::Disable {
+        return None;
+    }
+
+    let data = tokio::fs::read_to_string(progress_path(target_path))
+        .await
+        .ok()?;
+    let progress = parse_progress_file(&data)?;
+    (progress.snapshot_id == snapshot_id).then_some(progress)
+}
+
+/// Removes completed blocks from a snapshot and returns the valid completed indices.
+fn filter_completed_blocks(snapshot: &mut Snapshot, progress: ProgressFile) -> Option<Vec<i32>> {
+    if progress.snapshot_id != snapshot.snapshot_id {
+        return None;
+    }
+
+    let completed: std::collections::BTreeSet<i32> =
+        progress.completed_blocks.into_iter().collect();
+    let mut matched_blocks = Vec::new();
+    snapshot.blocks.retain(|block| {
+        if completed.contains(&block.index) {
+            matched_blocks.push(block.index);
+            false
+        } else {
+            true
+        }
+    });
+    Some(matched_blocks)
 }
 
 /// Returns the path to the checkpoint progress file for a given target path.
@@ -923,6 +967,22 @@ mod test {
     }
 
     #[test]
+    fn download_worker_count_defaults_and_accepts_positive_values() {
+        assert_eq!(
+            validated_worker_count(None).unwrap(),
+            SNAPSHOT_BLOCK_WORKERS
+        );
+        assert_eq!(validated_worker_count(Some(1)).unwrap(), 1);
+        assert_eq!(validated_worker_count(Some(100)).unwrap(), 100);
+    }
+
+    #[test]
+    fn download_worker_count_rejects_zero() {
+        let error = validated_worker_count(Some(0)).unwrap_err();
+        assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[test]
     fn progress_file_roundtrip() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("disk.img");
@@ -936,8 +996,7 @@ mod test {
         let data = serde_json::to_string(&progress).unwrap();
         std::fs::write(&path, &data).unwrap();
 
-        let loaded: ProgressFile =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let loaded = parse_progress_file(&std::fs::read_to_string(&path).unwrap()).unwrap();
 
         assert_eq!(loaded.snapshot_id, "snap-123");
         assert_eq!(loaded.completed_blocks, vec![0, 5, 10]);
@@ -945,47 +1004,289 @@ mod test {
 
     #[test]
     fn progress_file_filters_completed_blocks() {
-        let all_blocks = vec![
-            SnapshotBlock {
-                index: 0,
-                token: "a".into(),
-            },
-            SnapshotBlock {
-                index: 1,
-                token: "b".into(),
-            },
-            SnapshotBlock {
-                index: 2,
-                token: "c".into(),
-            },
-            SnapshotBlock {
-                index: 3,
-                token: "d".into(),
-            },
-        ];
+        let mut snapshot = Snapshot {
+            snapshot_id: "snap-123".to_string(),
+            volume_size: 1,
+            block_size: 512,
+            blocks: vec![
+                SnapshotBlock {
+                    index: 3,
+                    token: "token-3".into(),
+                },
+                SnapshotBlock {
+                    index: 17,
+                    token: "token-17".into(),
+                },
+                SnapshotBlock {
+                    index: 200,
+                    token: "token-200".into(),
+                },
+            ],
+        };
 
-        let completed: std::collections::BTreeSet<i32> = vec![0, 2].into_iter().collect();
-        let remaining: Vec<_> = all_blocks
-            .into_iter()
-            .filter(|b| !completed.contains(&b.index))
-            .collect();
+        let completed = filter_completed_blocks(
+            &mut snapshot,
+            ProgressFile {
+                snapshot_id: "snap-123".to_string(),
+                completed_blocks: vec![17, 17, 200, 999],
+            },
+        )
+        .unwrap();
 
-        assert_eq!(remaining.len(), 2);
-        assert_eq!(remaining[0].index, 1);
-        assert_eq!(remaining[1].index, 3);
+        assert_eq!(completed, vec![17, 200]);
+        assert_eq!(snapshot.blocks.len(), 1);
+        assert_eq!(snapshot.blocks[0].index, 3);
+        assert_eq!(snapshot.blocks[0].token, "token-3");
     }
 
     #[test]
     fn progress_file_ignores_mismatched_snapshot_id() {
-        let progress = ProgressFile {
-            snapshot_id: "snap-different".to_string(),
-            completed_blocks: vec![0, 1, 2],
+        let mut snapshot = Snapshot {
+            snapshot_id: "snap-123".to_string(),
+            volume_size: 1,
+            block_size: 512,
+            blocks: vec![SnapshotBlock {
+                index: 0,
+                token: "token-0".into(),
+            }],
         };
 
-        let current_snapshot_id = "snap-123";
-        let should_resume = progress.snapshot_id == current_snapshot_id;
+        let completed = filter_completed_blocks(
+            &mut snapshot,
+            ProgressFile {
+                snapshot_id: "snap-different".to_string(),
+                completed_blocks: vec![0],
+            },
+        );
 
-        assert!(!should_resume);
+        assert!(completed.is_none());
+        assert_eq!(snapshot.blocks.len(), 1);
+        assert_eq!(snapshot.blocks[0].index, 0);
+    }
+
+    #[test]
+    fn malformed_progress_file_is_ignored() {
+        assert!(parse_progress_file("{not-json").is_none());
+        assert!(parse_progress_file("").is_none());
+    }
+
+    #[test]
+    fn empty_or_stale_completed_indices_do_not_mark_a_resume() {
+        let mut snapshot = Snapshot {
+            snapshot_id: "snap-123".to_string(),
+            volume_size: 1,
+            block_size: 512,
+            blocks: vec![SnapshotBlock {
+                index: 8,
+                token: "token-8".into(),
+            }],
+        };
+
+        let completed = filter_completed_blocks(
+            &mut snapshot,
+            ProgressFile {
+                snapshot_id: "snap-123".to_string(),
+                completed_blocks: vec![100, 200],
+            },
+        )
+        .unwrap();
+
+        assert!(completed.is_empty());
+        assert_eq!(snapshot.blocks.len(), 1);
+        assert_eq!(snapshot.blocks[0].index, 8);
+    }
+
+    #[test]
+    fn checkpoint_with_all_snapshot_blocks_leaves_no_work() {
+        let mut snapshot = Snapshot {
+            snapshot_id: "snap-123".to_string(),
+            volume_size: 1,
+            block_size: 512,
+            blocks: vec![
+                SnapshotBlock {
+                    index: 4,
+                    token: "token-4".into(),
+                },
+                SnapshotBlock {
+                    index: 9,
+                    token: "token-9".into(),
+                },
+            ],
+        };
+
+        let completed = filter_completed_blocks(
+            &mut snapshot,
+            ProgressFile {
+                snapshot_id: "snap-123".to_string(),
+                completed_blocks: vec![4, 9, 100],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(completed, vec![4, 9]);
+        assert!(snapshot.blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn write_progress_persists_checkpoint_file() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+        let expected = vec![2, 19, 400];
+
+        write_progress(&target, "snap-123", &expected).await;
+
+        let content = std::fs::read_to_string(progress_path(&target)).unwrap();
+        let loaded = parse_progress_file(&content).unwrap();
+        assert_eq!(loaded.snapshot_id, "snap-123");
+        assert_eq!(loaded.completed_blocks, expected);
+
+        let loaded = read_checkpoint(&target, CheckpointBehavior::Enable, "snap-123")
+            .await
+            .unwrap();
+        let mut snapshot = Snapshot {
+            snapshot_id: "snap-123".to_string(),
+            volume_size: 1,
+            block_size: 512,
+            blocks: vec![
+                SnapshotBlock {
+                    index: 2,
+                    token: "token-2".into(),
+                },
+                SnapshotBlock {
+                    index: 7,
+                    token: "token-7".into(),
+                },
+                SnapshotBlock {
+                    index: 19,
+                    token: "token-19".into(),
+                },
+                SnapshotBlock {
+                    index: 400,
+                    token: "token-400".into(),
+                },
+            ],
+        };
+        let resumed = filter_completed_blocks(&mut snapshot, loaded).unwrap();
+        assert_eq!(resumed, expected);
+        assert_eq!(
+            snapshot
+                .blocks
+                .iter()
+                .map(|block| block.index)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_checkpointing_ignores_an_existing_sidecar() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+        write_progress(&target, "snap-123", &[1, 2, 3]).await;
+
+        assert!(
+            read_checkpoint(&target, CheckpointBehavior::Disable, "snap-123")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_for_another_snapshot_is_ignored() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+        write_progress(&target, "snap-old", &[1, 2, 3]).await;
+
+        assert!(
+            read_checkpoint(&target, CheckpointBehavior::Enable, "snap-new")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_checkpoint_sidecar_is_ignored() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+        std::fs::write(progress_path(&target), "{not-json").unwrap();
+
+        assert!(
+            read_checkpoint(&target, CheckpointBehavior::Enable, "snap-123")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_checkpoint_sidecar_starts_a_fresh_download() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+
+        assert!(
+            read_checkpoint(&target, CheckpointBehavior::Enable, "snap-123")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_write_replaces_the_previous_completed_list() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("disk.img");
+        write_progress(&target, "snap-123", &[1, 2]).await;
+        write_progress(&target, "snap-123", &[1, 2, 3]).await;
+
+        let loaded = read_checkpoint(&target, CheckpointBehavior::EnableAndKeep, "snap-123")
+            .await
+            .unwrap();
+        assert_eq!(loaded.completed_blocks, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn file_target_grow_creates_and_truncates_partial_file() {
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("disk.img");
+        let partial_path = dir.path().join("disk.img.partial");
+        std::fs::write(&partial_path, b"old contents longer than target").unwrap();
+        let mut target = FileTarget {
+            path: target_path,
+            partial_path: partial_path.clone(),
+        };
+
+        target.grow(8).await.unwrap();
+
+        assert_eq!(std::fs::metadata(&partial_path).unwrap().len(), 8);
+        assert_eq!(std::fs::read(partial_path).unwrap(), vec![0; 8]);
+    }
+
+    #[tokio::test]
+    async fn file_target_grow_rejects_negative_length() {
+        let dir = tempdir().unwrap();
+        let partial_path = dir.path().join("disk.img.partial");
+        let mut target = FileTarget {
+            path: dir.path().join("disk.img"),
+            partial_path: partial_path.clone(),
+        };
+
+        assert!(target.grow(-1).await.is_err());
+        assert!(!partial_path.exists());
+    }
+
+    #[tokio::test]
+    async fn finalize_moves_partial_file_to_new_target() {
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("disk.img");
+        let partial_path = dir.path().join("disk.img.partial");
+        std::fs::write(&partial_path, b"snapshot").unwrap();
+        let mut target = FileTarget {
+            path: target_path.clone(),
+            partial_path: partial_path.clone(),
+        };
+
+        target.finalize().await.unwrap();
+
+        assert_eq!(std::fs::read(target_path).unwrap(), b"snapshot");
+        assert!(!partial_path.exists());
     }
 
     #[tokio::test]
@@ -1003,5 +1304,38 @@ mod test {
         target.finalize().await.unwrap();
 
         assert_eq!(std::fs::read(target_path).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn finalize_replaces_existing_unicode_path() {
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("disk-画像.img");
+        let partial_path = dir.path().join("disk-画像.img.partial");
+        std::fs::write(&target_path, b"old").unwrap();
+        std::fs::write(&partial_path, b"new").unwrap();
+        let mut target = FileTarget {
+            path: target_path.clone(),
+            partial_path,
+        };
+
+        target.finalize().await.unwrap();
+
+        assert_eq!(std::fs::read(target_path).unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn finalize_failure_keeps_partial_file() {
+        let dir = tempdir().unwrap();
+        let target_path = dir.path().join("existing-directory");
+        let partial_path = dir.path().join("disk.img.partial");
+        std::fs::create_dir(&target_path).unwrap();
+        std::fs::write(&partial_path, b"snapshot").unwrap();
+        let mut target = FileTarget {
+            path: target_path,
+            partial_path: partial_path.clone(),
+        };
+
+        assert!(target.finalize().await.is_err());
+        assert_eq!(std::fs::read(partial_path).unwrap(), b"snapshot");
     }
 }

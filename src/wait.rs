@@ -9,7 +9,6 @@ use aws_sdk_ec2::types::SnapshotState;
 use aws_sdk_ec2::Client as Ec2Client;
 use snafu::{ensure, ResultExt, Snafu};
 use std::time::Duration;
-use tokio::time::sleep;
 
 #[derive(Debug, Snafu)]
 pub struct Error(error::Error);
@@ -140,9 +139,13 @@ impl SnapshotWaiter {
                 // Did not receive list; reset success count and try again (if we have spare attempts)
                 successes = 0;
             };
-            sleep(duration_between_attempts).await;
+            sleep_between_attempts(duration_between_attempts).await;
         }
     }
+}
+
+async fn sleep_between_attempts(duration: Duration) {
+    tokio::time::sleep(duration).await;
 }
 
 /// Potential errors while waiting for the snapshot.
@@ -166,5 +169,51 @@ mod error {
 
         #[snafu(display("Failed to reach desired state within {} attempts", max_attempts))]
         MaxAttempts { max_attempts: u8 },
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn default_wait_params_match_documented_policy() {
+        let params = WaitParams::default();
+
+        assert_eq!(params.state, "completed");
+        assert_eq!(params.successes_required, 3);
+        assert_eq!(params.max_attempts, 90);
+        assert_eq!(params.duration_between_attempts, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn wait_params_new_overrides_only_provided_values() {
+        let params = WaitParams::new(
+            Some("pending".to_string()),
+            None,
+            Some(10),
+            Some(Duration::from_millis(250)),
+        );
+
+        assert_eq!(params.state, "pending");
+        assert_eq!(params.successes_required, 3);
+        assert_eq!(params.max_attempts, 10);
+        assert_eq!(params.duration_between_attempts, Duration::from_millis(250));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn wait_delay_yields_to_other_tasks() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let task_ran = Arc::clone(&ran);
+        let task = tokio::spawn(async move {
+            task_ran.store(true, Ordering::SeqCst);
+        });
+
+        sleep_between_attempts(Duration::from_millis(20)).await;
+
+        assert!(ran.load(Ordering::SeqCst));
+        task.await.unwrap();
     }
 }
